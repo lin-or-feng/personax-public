@@ -1,0 +1,87 @@
+# PersonaX 人格配置
+name: 小鹿学姐
+description: 温暖闺蜜风，面向学生党/年轻女性
+
+tone: warm_girly
+habits:
+  - 每3句一个emoji
+  - 结尾常用"冲鸭/绝绝子/家人们"
+  - 善用"谁懂啊""我真的会谢"
+  - 短句优先，口语化
+forbidden:
+  - 书面语"综上所述"
+  - 英文技术缩写"IaaS/PoC/RAG"
+  - 感叹号连续超过2个
+sentence_length: short   # short / medium / long
+
+# Skill 路由偏好（多信号加权）
+skill_routing:
+  signals:
+    semantic: 0.5
+    keyword: 0.3
+    popularity: 0.2
+  popularity_boost: 0.1   # 高频 Skill 加权
+
+# 生成参数
+generation:
+  model: deepseek-chat
+  temperature: 0.8
+  max_tokens: 1024
+
+# RAG 配置
+rag:
+  knowledge_dir: knowledge
+  chunk_size: 600
+  top_k: 2
+  retrieval_mode: hybrid           # bm25 / dense / hybrid；消融评测可切换
+  min_score: 0.15                  # 未匹配后端时的保守回退
+  min_score_by_backend:            # 由 120 条回归集校准，不同 cosine 空间不能共用阈值
+    hashing: 0.15
+    ollama: 0.50
+    sentence-transformers: 0.50
+  embedding_backend: hashing       # hashing(离线测试) / ollama(真实语义向量) / sentence-transformers
+  embedding_model: bge-m3          # ollama pull bge-m3 后可启用
+  query_enhancer: rule             # rule(低延迟) / llm(调用 core.llm.complete)
+  enable_hyde: false
+  reranker: none                   # none / cross-encoder
+  reranker_model: BAAI/bge-reranker-base
+
+# Workflow 路由配置；execution_mode=agent 时使用下面的有界决策循环
+assistant:
+  router: rule                 # rule / llm（无效 JSON 自动回退 rule）
+  tool_runtime: langchain      # langchain(StructuredTool) / native；两者都必须经过 Harness
+  context_window_messages: 8   # 最近消息上限；新消息进入时自动淘汰最旧消息
+  context_window_tokens: 3000  # 对话历史估算 token 上限（问题/RAG/记忆另算）
+  context_message_tokens: 750  # 单条历史消息上限，防止一条超长文本占满窗口
+  checkpoint_messages: 20     # 本地恢复记录可多于实际注入模型的上下文
+  agent:                      # 请求显式选择 agent 才启用；默认仍是 workflow
+    max_searches: 3            # 模型不能增加额度、修改阈值或指定发布工具
+    decision_timeout_seconds: 20
+    decision_max_tokens: 240
+
+# LangGraph 运行状态：SQLite 持久化到项目 D 盘，自动清理过旧运行
+knowledge_catalog:
+  db_path: logs/knowledge.sqlite3
+  source_root: examples/ai_engineering
+  allowed_kb_ids: [ai-engineering, python-official]
+  embedding_backend: hashing
+  embedding_model: bge-m3
+  retrieval_mode: hybrid
+  min_score: 0.15
+  top_k: 4
+
+# LangGraph 运行状态
+langgraph:
+  checkpoint_path: logs/langgraph_checkpoints.sqlite3
+  retention_runs: 100
+
+# Harness 规则
+harness:
+  max_retries: 2
+  timeout_seconds: 30
+  require_approval: true
+  sensitive_tools: [xhs_publish]
+  rate_limit: 60                 # Skill 调用预算（滑动窗口）
+  rate_window_seconds: 60
+  publish_rate_limit: 3          # 真实发布使用独立滑动窗口
+  publish_rate_window_seconds: 60

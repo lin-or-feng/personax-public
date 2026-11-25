@@ -1,0 +1,46 @@
+.git
+.github
+.idea
+.vscode
+.venv
+.venv-ocr
+venv
+node_modules
+frontend/node_modules
+frontend/dist
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+
+# Secrets and local browser sessions must never enter the build context.
+.env
+.env.*
+!.env.example
+storage_state.json
+storage_state*.json
+*.key
+*.pem
+*.p12
+.streamlit/secrets.toml
+docs/JOB_APPLICATION_BRIEF.md
+docs/上下文摘要.md
+
+# Runtime state is persisted with Compose volumes instead.
+logs
+.rag_cache
+.tmp
+.tmp_*
+publish_log.json
+eval_results.csv
+assets/covers
+
+# Local QA/resume artifacts and generated test directories.
+artifacts
+tools
+probe_*
+pxtest_*
+px2_*
+pytest-cache-files-*
+.pytest_cache

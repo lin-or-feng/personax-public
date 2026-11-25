@@ -1,0 +1,721 @@
+"""商用化新增功能测试：合规引擎 / 发布门禁 / 调度器 / 发布器安全特性
+
+注：不用 pytest 自带 tmp_path（沙箱 ACL 拦截其收尾清理），
+改用项目内 .test_tmp 目录 + 手动清理。
+"""
+import json
+import shutil
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from core.types import Draft, SkillInput
+from core.compliance import ComplianceEngine
+from core.harness import Harness, RuleConfig
+from core.registry import get
+from core.orchestrator import Orchestrator
+from publishers.xhs import (
+    DryRunPublisher,
+    XhsPlaywrightPublisher,
+    ApprovalDenied,
+    LoginRequired,
+)
+from publishers.scheduler import (
+    ContentBank,
+    PublishLog,
+    PublishScheduler,
+)
+
+
+@pytest.fixture()
+def persona():
+    return {
+        "name": "小鹿学姐", "tone": "warm_girly",
+        "habits": ["每3句一个emoji"], "forbidden": ["综上所述", "IaaS"],
+        "sentence_length": "short",
+        "harness": {"max_retries": 1, "rate_limit": 10, "require_approval": False},
+    }
+
+
+@pytest.fixture()
+def workdir():
+    """项目内临时目录（沙箱安全），yield 后清理
+
+    注意：不能用 tempfile.mkdtemp —— 其 mode=0o700 会被沙箱映射为
+    受限 DACL（创建后连本进程都无法建子目录）；必须用默认 mode(0o777) 建目录。
+    """
+    from uuid import uuid4
+    d = Path(f"pxtest_{uuid4().hex[:10]}")
+    d.mkdir()  # 0o777
+    yield d
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------- 合规引擎 ----------
+
+class TestCompliance:
+    def test_hits_ad_law(self):
+        eng = ComplianceEngine()
+        rep = eng.check(title="全网最低价，只有这里才有", body="")
+        assert not rep.ok
+        assert any(h.category == "ad_law" for h in rep.hits)
+
+    def test_hits_platform_guidance(self):
+        eng = ComplianceEngine()
+        rep = eng.check(title="", body="加微信领取资料")
+        assert not rep.ok
+        assert any(h.category == "platform" for h in rep.hits)
+
+    def test_normal_text_passes(self):
+        eng = ComplianceEngine()
+        rep = eng.check(title="秋招穿搭分享", body="家人们谁懂啊，这样穿绝了🍃")
+        assert rep.ok
+
+    def test_no_false_positive_last(self):
+        # 「最后」不应命中「最」类绝对化用语（正则变体保证）
+        eng = ComplianceEngine()
+        rep = eng.check(title="", body="最后提醒大家一句，别踩坑")
+        assert rep.ok
+
+    def test_regex_variants_from_config_are_enforced(self):
+        from core.compliance import load_compliance_config
+
+        eng = ComplianceEngine(load_compliance_config("config/compliance.yaml"))
+        rep = eng.check(title="最好的选择", body="这是第一推荐")
+        assert not rep.ok
+        assert {hit.match for hit in rep.hits} >= {"最好", "第一推荐"}
+
+    def test_invalid_custom_regex_falls_back_to_literal(self):
+        eng = ComplianceEngine({"custom": ["["]})
+        rep = eng.check(title="[测试", body="")
+        assert not rep.ok and rep.hits[0].match == "["
+
+    def test_config_fail_safe(self):
+        # 配置文件不存在时用内置词表，不崩溃
+        from core.compliance import load_compliance_config
+        eng = ComplianceEngine(load_compliance_config("nope.yaml"))
+        rep = eng.check(title="稳赚不赔", body="")
+        assert not rep.ok
+
+
+# ---------- 发布就绪门禁 Skill ----------
+
+class TestPublishGate:
+    def test_ready_draft(self):
+        skill = get("xhs_publish")
+        draft = Draft(topic="t", title="秋招穿搭分享", body="正文内容", tags=["#穿搭"])
+        out = skill.run(SkillInput(draft=draft, context={}))
+        assert out.draft.metadata["publish_ready"] is True
+
+    def test_missing_fields_blocked(self):
+        skill = get("xhs_publish")
+        draft = Draft(topic="t")  # 空标题/正文/标签
+        out = skill.run(SkillInput(draft=draft, context={}))
+        assert out.draft.metadata["publish_ready"] is False
+        assert out.draft.metadata["publish_issues"]
+
+
+# ---------- LLM 运行时配置 ----------
+
+class TestLLMConfigure:
+    def test_configure_override(self):
+        from core import llm
+        llm.configure(model="deepseek-reasoner", temperature=0.2)
+        assert llm._OVERRIDES["model"] == "deepseek-reasoner"
+        assert llm._OVERRIDES["temperature"] == 0.2
+        # 离线降级路径不受 override 影响，仍返回文本
+        text = llm.complete("写一篇小红书正文，主题《测试》")
+        assert "测试" in text
+        # 复位，避免影响其他用例
+        llm.configure(model="deepseek-chat", temperature=0.8)
+
+
+# ---------- 内容质量升级（提示词资产 / RAG / Skill） ----------
+
+class TestPromptsAsset:
+    def test_load_prompts_yaml(self):
+        from core.prompts import load_prompts
+        p = load_prompts("config/prompts.yaml")
+        assert "title" in p and "user" in p["title"]
+        assert "{topic}" in p["body"]["user"] and "{rag_context}" in p["body"]["user"]
+
+    def test_load_prompts_fail_safe(self):
+        from core.prompts import load_prompts
+        p = load_prompts("nope.yaml")
+        assert "title" in p and "user" in p["title"]   # 缺失回退内置
+
+
+class TestChineseRAG:
+    def test_bm25_prefers_exact_repeated_terms(self):
+        from core.rag import BM25Index, Chunk
+        chunks = [
+            Chunk(id="a", text="秋招 面试 秋招 简历"),
+            Chunk(id="b", text="考研 英语 复习"),
+        ]
+        rows = BM25Index().search("秋招 简历", chunks, top_k=2)
+        assert rows[0][0].id == "a" and rows[0][1] > 0
+        assert all(score > 0 for _, score in rows)
+
+    def test_rrf_fuses_independent_rankings(self):
+        from core.rag import Chunk, reciprocal_rank_fusion
+        a, b = Chunk(id="a", text="a"), Chunk(id="b", text="b")
+        fused = reciprocal_rank_fusion([[(a, 9.0), (b, 2.0)], [(b, 0.9), (a, 0.1)]])
+        assert {item_id for item_id, _ in fused} == {"a", "b"}
+
+    def test_dense_search_uses_exact_knn(self):
+        from core.rag import VectorStore, Chunk
+        store = VectorStore()
+        store.add(Chunk(id="a", text="秋招面试穿搭"))
+        store.add(Chunk(id="b", text="考研英语复习"))
+        rows = store.dense_search("秋招", top_k=1)
+        assert rows and rows[0][0].id == "a"
+        assert store.last_dense_mode == "knn-exact"
+
+    def test_retrieval_mode_supports_ablation_and_validates_input(self):
+        from core.rag import Chunk, HashingEmbedder, RAGPipeline, VectorStore
+
+        class CountingEmbedder(HashingEmbedder):
+            def __init__(self):
+                super().__init__()
+                self.query_calls = 0
+
+            def encode(self, texts):
+                self.query_calls += 1
+                return super().encode(texts)
+
+        embedder = CountingEmbedder()
+        store = VectorStore(embedder=embedder)
+        store.add(Chunk(id="a", text="BM25 关键词检索"))
+        store.add(Chunk(id="b", text="dense 向量召回"))
+        embedder.query_calls = 0
+
+        lexical = RAGPipeline(store, retrieval_mode="bm25")
+        assert lexical.retrieve_hits("BM25", top_k=1)
+        assert embedder.query_calls == 0
+        assert lexical.last_trace["retrieval_mode"] == "lexical"
+        assert lexical.last_trace["dense_mode"] == "disabled"
+
+        dense = RAGPipeline(store, retrieval_mode="dense")
+        assert dense.retrieve_hits("向量召回", top_k=1)
+        assert embedder.query_calls > 0
+        assert dense.last_trace["retrieval_mode"] == "dense"
+
+        with pytest.raises(ValueError, match="retrieval_mode"):
+            RAGPipeline(store, retrieval_mode="unsupported")
+
+    def test_min_score_is_calibrated_per_embedding_backend(self):
+        from core.rag import Chunk, RAGPipeline, VectorStore, resolve_min_score
+
+        pipeline = RAGPipeline(VectorStore())
+        pipeline.store.add(Chunk(id="a", text="测试文档"))
+        config = {
+            "min_score": 0.12,
+            "min_score_by_backend": {"hashing": 0.15, "ollama": 0.50},
+        }
+
+        assert resolve_min_score(config, pipeline) == 0.15
+        pipeline.store.embedder.name = "ollama:bge-m3"
+        assert resolve_min_score(config, pipeline) == 0.50
+        assert resolve_min_score({"min_score": 0.12}, pipeline) == 0.12
+        with pytest.raises(ValueError, match="min_score"):
+            resolve_min_score({"min_score": 1.5}, pipeline)
+
+    def test_ollama_embedder_uses_batch_embed_api(self, monkeypatch):
+        from core.rag import OllamaEmbedder
+
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return b'{"embeddings": [[1.0, 0.0], [0.0, 1.0]]}'
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        embedder = OllamaEmbedder(model="bge-m3")
+        vectors = embedder.encode(["秋招", "考研"])
+        assert vectors == [[1.0, 0.0], [0.0, 1.0]]
+        assert captured["url"].endswith("/api/embed")
+        assert captured["payload"] == {"model": "bge-m3", "input": ["秋招", "考研"]}
+        assert embedder.dimension == 2
+
+    def test_ollama_embedding_normalizes_chat_v1_url(self, monkeypatch):
+        from core.rag import _make_embedder
+
+        monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
+        monkeypatch.delenv("RAG_OLLAMA_BASE_URL", raising=False)
+        embedder = _make_embedder("ollama", "bge-m3")
+        assert embedder.base_url == "http://127.0.0.1:11434"
+
+    def test_document_embedding_cache_persists_without_caching_queries(self, workdir):
+        from core.rag import CachedEmbedder
+
+        class FakeEmbedder:
+            name = "fake:model"
+            dimension = 2
+
+            def __init__(self):
+                self.calls = 0
+
+            def encode(self, texts):
+                self.calls += 1
+                return [[float(len(text)), 1.0] for text in texts]
+
+        cache_path = workdir / "embeddings.sqlite3"
+        first_backend = FakeEmbedder()
+        first = CachedEmbedder(first_backend, cache_path)
+        assert first.encode_documents(["秋招", "面试"]) == [[2.0, 1.0], [2.0, 1.0]]
+        assert first_backend.calls == 1 and first.cache_misses == 2
+
+        second_backend = FakeEmbedder()
+        second = CachedEmbedder(second_backend, cache_path)
+        assert second.encode_documents(["秋招", "面试"]) == [[2.0, 1.0], [2.0, 1.0]]
+        assert second_backend.calls == 0 and second.cache_hits == 2
+        second.encode(["用户查询"])
+        assert second_backend.calls == 1
+
+    def test_rule_query_rewrite_is_explainable(self):
+        from core.rag import RuleBasedQueryEnhancer
+        variants = RuleBasedQueryEnhancer().rewrite("请问秋招简历如何优化？")
+        assert variants[0] == "请问秋招简历如何优化？"
+        assert any("如何" not in item for item in variants[1:])
+
+    def test_cross_encoder_reranker_is_wired_into_pipeline(self):
+        from core.rag import Chunk, RAGPipeline, VectorStore
+
+        class FakeReranker:
+            model_name = "fake-cross-encoder"
+
+            def rerank(self, query, chunks, top_k):
+                rows = [(chunk, 10.0 if chunk.id == "b" else 1.0) for chunk in chunks]
+                return sorted(rows, key=lambda item: item[1], reverse=True)[:top_k]
+
+        store = VectorStore()
+        store.add(Chunk(id="a", text="秋招简历优化"))
+        store.add(Chunk(id="b", text="秋招面试技巧"))
+        rag = RAGPipeline(store, reranker=FakeReranker())
+        hits = rag.retrieve_hits("秋招", top_k=2)
+        assert hits[0].chunk.id == "b"
+        assert hits[0].rerank_score == 10.0
+        assert rag.last_trace["reranker"] == "fake-cross-encoder"
+
+    def test_bigram_similarity_works(self):
+        from core.rag import VectorStore, Chunk, RAGPipeline
+        store = VectorStore()
+        store.add(Chunk(id="1", text="秋招穿搭技巧 衬衫 西装", summary="面试穿搭"))
+        store.add(Chunk(id="2", text="考研英语复习方法", summary="考研"))
+        rag = RAGPipeline(store)
+        results = rag.retrieve("秋招面试穿搭怎么选衬衫", top_k=1)
+        assert results and results[0].id == "1"
+
+    def test_build_rag_from_dir(self):
+        from core.rag import build_rag_from_dir
+        pipe = build_rag_from_dir("knowledge")
+        assert len(pipe.store.chunks) >= 2
+
+    def test_build_rag_reads_nested_public_reference_metadata(self, workdir):
+        from core.rag import build_rag_from_dir
+
+        nested = workdir / "public" / "wikipedia_zh"
+        nested.mkdir(parents=True)
+        (nested / "人工智能.md").write_text(
+            "---\ntopic: 人工智能\nkeywords: [AI, 机器学习]\n"
+            "retrieval_role: reference\nsource: Wikipedia 中文\n"
+            "source_url: https://zh.wikipedia.org/wiki/test\n"
+            "license: CC BY-SA 4.0\n---\n\n人工智能是计算机科学的研究领域。",
+            encoding="utf-8",
+        )
+        pipe = build_rag_from_dir(workdir, embedding_backend="hashing")
+        chunk = next(iter(pipe.store.chunks.values()))
+        assert chunk.metadata["retrieval_role"] == "reference"
+        assert chunk.metadata["source"].endswith("人工智能.md")
+        assert chunk.metadata["source_name"] == "Wikipedia 中文"
+
+    def test_frontmatter_parse(self):
+        from core.rag import _parse_frontmatter, build_rag_from_dir
+        meta, body = _parse_frontmatter("---\ntopic: 秋招穿搭\nkeywords: [面试, 衬衫]\n---\n正文内容")
+        assert meta.get("topic") == "秋招穿搭"
+        assert "正文内容" in body and "秋招穿戴" not in body
+        # 无 front-matter 兜底
+        meta2, body2 = _parse_frontmatter("只有正文")
+        assert meta2 == {} and body2 == "只有正文"
+
+    def test_retrieve_relevant_filters_irrelevant(self):
+        from core.rag import VectorStore, Chunk, RAGPipeline
+        store = VectorStore()
+        store.add(Chunk(id="a", text="秋招面试穿搭攻略", summary="秋招穿搭",
+                        metadata={"keywords": ["面试", "穿搭", "秋招"]}))
+        store.add(Chunk(id="b", text="考研英语完形填空技巧", summary="考研英语",
+                        metadata={"keywords": ["考研", "英语"]}))
+        rag = RAGPipeline(store)
+        rel = rag.retrieve_relevant("秋招面试穿搭", top_k=2, min_score=0.10)
+        assert rel and rel[0].id == "a"          # 命中相关性高的
+        # 高出阈值但更不相关的话，也会被过滤（这里至少不把 b 排前面）
+        assert rel[0].id == "a"
+
+    def test_relevance_threshold_skips_when_irrelevant(self):
+        from core.rag import VectorStore, Chunk, RAGPipeline
+        store = VectorStore()
+        store.add(Chunk(id="q", text="考研英语复习方法", summary="考研英语",
+                        metadata={"keywords": ["考研", "英语"]}))
+        rag = RAGPipeline(store)
+        rel = rag.retrieve_relevant("秋招面试穿搭怎么选", top_k=2, min_score=0.20)
+        assert rel == []                          # 主题不贴近 → 不注入，避免跑题
+
+
+class TestSkillsQuality:
+    def test_orchestrator_injects_rag_context(self, persona):
+        orch = Orchestrator(persona=persona, harness=Harness(RuleConfig(**persona["harness"])))
+        draft = orch.run("秋招穿搭")
+        assert draft.title and draft.body and draft.tags   # 离线链路不因 RAG 注入而破坏
+        assert draft.metadata["rag_trace"]["fusion"] == "rrf"
+
+    def test_tag_fallback_on_garbage_output(self):
+        # 离线/异常输出会被清洗并回退模板标签，绝不产出垃圾标签
+        skill = get("tag_selector")
+        draft = Draft(topic="秋招穿搭")
+        out = skill.run(SkillInput(draft=draft, context={"persona": {}}))
+        assert out.draft.tags and all(t.startswith("#") for t in out.draft.tags)
+        assert not any("占位" in t for t in out.draft.tags)
+
+    def test_title_kept_under_20(self):
+        skill = get("title_generator")
+        draft = Draft(topic="秋招穿搭")
+        out = skill.run(SkillInput(draft=draft, context={"persona": {}}))
+        assert out.draft.title and len(out.draft.title) <= 20
+
+
+# ---------- 浏览器自动回退 ----------
+
+class TestBrowserFallback:
+    def test_browser_order(self):
+        from publishers.xhs import _browser_order
+        assert _browser_order("chrome") == ["chrome", "msedge", None]
+        assert _browser_order("msedge") == ["msedge", None]
+        # 不指定浏览器时：优先 Edge（Windows 自带），再回退内置 Chromium
+        assert _browser_order(None) == ["msedge", None]
+
+    def test_browser_exe_paths_known(self):
+        from publishers.xhs import _browser_exe_paths
+        assert isinstance(_browser_exe_paths("chrome"), list)
+        assert isinstance(_browser_exe_paths("msedge"), list)
+
+
+# ---------- 多人格库 ----------
+
+class TestPersonaLibrary:
+    def test_list_personas(self):
+        from core.persona import list_personas, get_persona
+        names = list_personas()
+        assert "小鹿学姐" in names and "干货知识风" in names
+        p = get_persona("干货知识风")
+        assert p.get("name") == "笔记君"
+        assert p.get("tone") == "professional_warm"
+
+    def test_resolve_merges_over_base(self):
+        from core.persona import resolve_persona
+        p = resolve_persona("干货知识风")
+        assert p.get("name") == "笔记君"
+        assert p.get("sentence_length") == "medium"
+
+    def test_resolve_default_when_missing(self):
+        from core.persona import resolve_persona
+        p = resolve_persona("不存在的人格")
+        assert p.get("name")   # 回退默认，不报错
+
+    def test_add_and_get(self, workdir):
+        from core.persona import add_persona, get_persona, list_personas
+        p = str(workdir / "p.yaml")
+        add_persona("测试人格", {"name": "测试君", "tone": "fresh"}, p)
+        assert "测试人格" in list_personas(p)
+        assert get_persona("测试人格", p).get("name") == "测试君"
+
+
+# ---------- 联网增强 ----------
+
+class TestWebSearch:
+    def test_disabled_returns_empty(self, monkeypatch):
+        import os
+        os.environ["WEB_SEARCH_ENABLED"] = "0"
+        from core.websearch import search_web, build_web_context
+        assert search_web("秋招穿搭") == []
+        assert build_web_context("秋招穿搭") == ""
+
+    def test_off_backend_returns_empty(self, monkeypatch):
+        import os
+        os.environ["WEB_SEARCH_ENABLED"] = "1"
+        os.environ["WEB_SEARCH_BACKEND"] = "off"
+        from core.websearch import search_web
+        assert search_web("秋招穿搭") == []
+
+    def test_backend_switch(self, monkeypatch):
+        import os
+        os.environ["WEB_SEARCH_BACKEND"] = "bocha"
+        os.environ.pop("BOCHA_API_KEY", None)   # 无 Key → 空
+        from core.websearch import _search_bocha
+        assert _search_bocha("秋招穿搭", 3) == []
+
+    def test_build_web_context_format(self, monkeypatch):
+        # 模拟返回结果，验证格式化与相关性过滤
+        import os
+        os.environ["WEB_SEARCH_ENABLED"] = "1"
+        from core import websearch
+        monkeypatch.setattr(websearch, "search_web",
+                            lambda q, top_k=3: ["秋招穿搭 热点A：内容1", "面试穿搭 热点B：内容2"])
+        ctx = websearch.build_web_context("秋招穿搭")
+        assert "近期相关热点" in ctx and "热点A" in ctx
+        # 无结果 → 空串
+        monkeypatch.setattr(websearch, "search_web", lambda q, top_k=3: [])
+        assert websearch.build_web_context("秋招穿搭") == ""
+        # 无关结果被过滤 → 空串（防跑题）
+        monkeypatch.setattr(websearch, "search_web",
+                            lambda q, top_k=3: ["字典解释秋字的意思", "别的话题内容"])
+        assert websearch.build_web_context("秋招穿搭") == ""
+
+    def test_web_search_has_sliding_request_limit(self, monkeypatch):
+        from core import websearch
+
+        websearch._OVERRIDES.clear()
+        websearch._RATE_LIMITERS.clear()
+        websearch._SEMAPHORES.clear()
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "1")
+        monkeypatch.setenv("WEB_SEARCH_BACKEND", "bing")
+        monkeypatch.setenv("WEB_SEARCH_REQUESTS_PER_MINUTE", "1")
+        monkeypatch.setattr(
+            websearch, "_scrape_bing", lambda query, top_k: ["结果"],
+        )
+
+        assert websearch.search_web("第一次") == ["结果"]
+        assert websearch.search_web("第二次") == []
+
+
+# ---------- 封面生成（多模态） ----------
+
+class TestCoverGen:
+    def test_generate_cover_png(self):
+        from core.covergen import generate_cover
+        from PIL import Image
+        p = generate_cover("秋招战袍穿对，offer翻倍", topic="秋招穿搭",
+                           out_dir=".tmp_covers")
+        im = Image.open(p)
+        assert im.size == (600, 800)
+        import shutil
+        shutil.rmtree(".tmp_covers", ignore_errors=True)
+
+    def test_ensure_cover_for_draft(self):
+        from core.covergen import ensure_cover_for_draft
+        from core.types import Draft
+        d = Draft(topic="秋招穿搭", title="秋招战袍穿对，offer翻倍")
+        path = ensure_cover_for_draft(d, out_dir=".tmp_covers")
+        assert path and d.metadata["cover"] == path
+        assert d.metadata["images"][0] == path
+        import shutil
+        shutil.rmtree(".tmp_covers", ignore_errors=True)
+
+    def test_no_title_no_cover(self):
+        from core.covergen import ensure_cover_for_draft
+        from core.types import Draft
+        d = Draft(topic="无标题")
+        assert ensure_cover_for_draft(d) is None
+
+    def test_all_styles(self):
+        from core.covergen import generate_cover, configure
+        from PIL import Image
+        import shutil
+        for s in ("premium", "minimal", "gradient", "split", "card"):
+            configure(style=s)
+            p = generate_cover("风格测试标题", topic="测试", out_dir=".tmp_covers")
+            assert Image.open(p).size == (600, 800)
+        configure(style="premium")   # 复位默认
+        shutil.rmtree(".tmp_covers", ignore_errors=True)
+
+    def test_ai_fallback_without_key(self):
+        from core.covergen import generate_cover, configure
+        import os
+        os.environ.pop("SILICONFLOW_API_KEY", None)
+        configure(ai_enabled=True)
+        p = generate_cover("AI回退测试", topic="测试")
+        assert p.exists()   # 无 Key 自动回退本地海报
+
+    def test_description_driven(self):
+        from core.covergen import generate_cover, configure, _parse_style_desc
+        from PIL import Image
+        import shutil
+        configure(style="gradient")
+        # 描述「粉色渐变 可爱风」→ 粉色 + 渐变
+        parsed = _parse_style_desc("粉色渐变 可爱风")
+        assert parsed["style"] == "gradient" and parsed["palette"] is not None
+        p = generate_cover("描述测试", topic="测试", out_dir=".tmp_covers",
+                           description="粉色渐变 可爱风")
+        assert Image.open(p).size == (600, 800)
+        # 描述「深色高级感 金色线条」→ premium
+        parsed2 = _parse_style_desc("深色高级感 金色线条")
+        assert parsed2["style"] == "premium"
+        # 空描述 → 不解析
+        assert _parse_style_desc("") == {}
+        shutil.rmtree(".tmp_covers", ignore_errors=True)
+
+    def test_build_persona_block(self):
+        from core.persona import build_persona_block
+        p = {"name": "小鹿学姐", "tone": "warm_girly",
+             "habits": ["短句优先"], "opening": "痛点共鸣", "interaction": "求收藏",
+             "title_style": "数字+emoji", "example": "家人们谁懂啊"}
+        block = build_persona_block(p)
+        assert "你的人设：小鹿学姐" in block
+        assert "开头风格：痛点共鸣" in block and "互动引导：求收藏" in block
+        assert "风格示例：家人们谁懂啊" in block
+
+    def test_suggest_persona(self):
+        from core.persona import suggest_persona
+        assert suggest_persona("考研英语复习方法") == "干货知识风"
+        assert suggest_persona("面试被问缺点怎么答") == "职场进阶风"
+        assert suggest_persona("随便聊聊") is None   # 无匹配不推荐
+
+
+# ---------- 发布器安全特性 ----------
+
+class TestPublisherSafety:
+    def test_real_publish_safety_lock_defaults_to_off(self, monkeypatch):
+        from core.publish_safety import REAL_PUBLISH_ENV, real_publish_enabled
+        monkeypatch.delenv(REAL_PUBLISH_ENV, raising=False)
+        assert real_publish_enabled() is False
+        monkeypatch.setenv(REAL_PUBLISH_ENV, "1")
+        assert real_publish_enabled() is True
+
+    def test_keep_browser_on_failure_is_opt_in(self):
+        pub = XhsPlaywrightPublisher(keep_browser_on_failure=True)
+        assert pub.keep_browser_on_failure is True
+
+    def test_normalize_body_removes_windows_and_blank_lines(self):
+        pub = XhsPlaywrightPublisher()
+        assert pub._normalize_body("第一段\r\n \r\n第二段\n\n第三段  ") == "第一段\n第二段\n第三段"
+
+    def test_dry_run_publishes(self):
+        draft = Draft(topic="t", title="标题", body="正文")
+        res = DryRunPublisher().publish(draft)
+        assert res.success
+
+    def test_idempotent_skip(self, workdir):
+        # 幂等检查在登录态检查之前：无 storage_state 也能返回跳过
+        pub = XhsPlaywrightPublisher(
+            storage_state=str(workdir / "missing.json"), auto_approve=True)
+        draft = Draft(topic="t", title="标题", body="正文",
+                      metadata={"publish_url": "https://xhs.com/note/abc"})
+        res = pub.publish(draft)
+        assert "IDEMPOTENT" in res.message
+        assert res.url == "https://xhs.com/note/abc"
+
+    def test_login_required_without_state(self, workdir):
+        pub = XhsPlaywrightPublisher(
+            storage_state=str(workdir / "missing.json"), auto_approve=True)
+        draft = Draft(topic="t", title="标题", body="正文")
+        with pytest.raises(LoginRequired):
+            pub.publish(draft)
+
+    def test_approval_denied_raises(self, workdir):
+        # 有登录态文件但用户拒绝
+        state = workdir / "state.json"
+        state.write_text("{}", encoding="utf-8")
+        pub = XhsPlaywrightPublisher(storage_state=str(state), auto_approve=False)
+        draft = Draft(topic="t", title="标题", body="正文")
+        with pytest.raises(ApprovalDenied):
+            pub.publish(draft, confirm=lambda d: False)
+
+    def test_rate_limit_via_harness(self, workdir):
+        state = workdir / "state.json"
+        state.write_text("{}", encoding="utf-8")
+        harness = Harness(RuleConfig(publish_rate_limit=1))
+        pub = XhsPlaywrightPublisher(storage_state=str(state), auto_approve=True,
+                                     harness=harness, user_id="u1")
+        draft = Draft(topic="t", title="标题", body="正文")
+        assert harness.check_publish_quota("u1")[0]   # 先占掉发布额度
+        res = pub.publish(draft)
+        assert not res.success
+        assert "限速" in res.message
+
+    def test_real_publish_is_single_flight_per_process(self, workdir):
+        from publishers import xhs
+
+        pub = XhsPlaywrightPublisher(
+            storage_state=str(workdir / "missing.json"), auto_approve=True,
+        )
+        draft = Draft(topic="t", title="标题", body="正文")
+        assert xhs._PUBLISH_SEMAPHORE.acquire(blocking=False)
+        try:
+            result = pub.publish(draft)
+        finally:
+            xhs._PUBLISH_SEMAPHORE.release()
+
+        assert not result.success
+        assert "已有真实发布任务" in result.message
+
+
+# ---------- 调度器 ----------
+
+class TestScheduler:
+    def test_due_selection(self, workdir):
+        bank_dir = workdir / "bank"
+        bank_dir.mkdir()
+        (bank_dir / "a.json").write_text(json.dumps({
+            "id": "a", "topic": "秋招穿搭",
+            "scheduled_at": "2026-01-01 09:00"}), encoding="utf-8")
+        (bank_dir / "b.json").write_text(json.dumps({
+            "id": "b", "topic": "租房避坑",
+            "scheduled_at": "2099-01-01 09:00"}), encoding="utf-8")
+        bank = ContentBank(str(bank_dir))
+        log = PublishLog(path=str(workdir / "log.json")).load()
+        orch = Orchestrator(persona={"harness": {}}, harness=Harness(RuleConfig()))
+        sched = PublishScheduler(orchestrator=orch, bank=bank, log=log)
+        due = sched.due_items()
+        assert [d.id for d in due] == ["a"]
+
+    def test_run_once_dry_run_publishes_and_logs(self, workdir):
+        bank_dir = workdir / "bank"
+        bank_dir.mkdir()
+        (bank_dir / "a.json").write_text(json.dumps({
+            "id": "a", "topic": "秋招穿搭",
+            "scheduled_at": "2026-01-01 09:00",
+            "title": "秋招穿搭｜谁懂啊", "body": "正文内容，家人们冲鸭🍃",
+            "tags": ["#穿搭"]}), encoding="utf-8")
+        log = PublishLog(path=str(workdir / "log.json")).load()
+        sched = PublishScheduler(
+            orchestrator=Orchestrator(persona={"harness": {}}, harness=Harness(RuleConfig())),
+            publisher=DryRunPublisher(),
+            bank=ContentBank(str(bank_dir)),
+            log=log,
+        )
+        report = sched.run_once()
+        assert report[0]["status"] == "published"
+        assert log.records["a"]["status"] == "published"
+        # 幂等：再跑一次不再发
+        assert sched.run_once() == []
+
+    def test_compliance_blocks(self, workdir):
+        bank_dir = workdir / "bank"
+        bank_dir.mkdir()
+        (bank_dir / "bad.json").write_text(json.dumps({
+            "id": "bad", "topic": "减肥",
+            "scheduled_at": "2026-01-01 09:00",
+            "title": "三天见效的减肥神药", "body": "稳赚不赔，加微信领取",
+            "tags": ["#减肥"]}), encoding="utf-8")
+        log = PublishLog(path=str(workdir / "log.json")).load()
+        sched = PublishScheduler(
+            orchestrator=Orchestrator(persona={"harness": {}}, harness=Harness(RuleConfig())),
+            publisher=DryRunPublisher(),
+            bank=ContentBank(str(bank_dir)),
+            log=log,
+        )
+        report = sched.run_once()
+        assert report[0]["status"] == "skipped"
+        assert "合规拦截" in report[0]["reason"]

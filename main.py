@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""PersonaX CLI —— 小红书内容生成 + 商用级自动发布
+
+子命令：
+  generate  生成一篇笔记（默认；含合规检查 + 干跑发布）
+  publish   发布指定稿件（--real 真发 / 默认干跑）
+  schedule  定时自动发布（--run-once 或 --daemon 无人值守）
+  login     浏览器登录一次，导出登录态 storage_state.json
+  eval      跑评测集，输出 eval_results.csv
+  rag-eval  跑可复现的 RAG Recall/MRR 质量门禁
+  telemetry 查看安全遥测聚合或指定 Trace
+  feedback  查看反馈聚合并导出待人工标注候选
+  knowledge 本地领域文档入库、更新、检索、删除与任务核查
+
+示例：
+  python main.py generate --topic "秋招穿搭"
+  python main.py publish --draft content_bank/example.json --real
+  python main.py schedule --run-once
+  python main.py schedule --daemon --interval 60 --yes
+  python main.py login
+  python main.py eval
+"""
+from __future__ import annotations
+import argparse
+import json
+import sys
+import os
+import uuid
+
+sys.path.insert(0, os.path.dirname(__file__))
+
+# 读取 .env（若存在）：DEEPSEEK_API_KEY 等配置，系统环境变量优先
+from core.envfile import load_env_file
+load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
+
+# Windows 控制台默认 GBK，强制 UTF-8 输出（否则 emoji 打印直接崩）
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
+
+import yaml
+
+import skills  # noqa: F401  触发 @register
+from core.orchestrator import Orchestrator
+from core.harness import Harness, RuleConfig, AuditLog
+from core.compliance import ComplianceEngine, load_compliance_config
+from core.publish_safety import real_publish_enabled, real_publish_disabled_message
+from publishers.xhs import (
+    DryRunPublisher, XhsPlaywrightPublisher, export_login_state, debug_selectors,
+    list_recent_notes, probe_publish_ui,
+)
+
+
+def load_persona(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def resolve_persona_arg(value: str) -> dict:
+    """--persona 支持「人格库名字」或「yaml 文件路径」。
+
+    默认人格：未指定/空/未知名字 → 都用 persona.yaml（默认人格），
+    只有显式传入人格库中的名字时才切换为其他人格。
+    """
+    from core.persona import list_personas, resolve_persona
+    if value and value in list_personas():
+        return resolve_persona(value)
+    if value and os.path.exists(value):
+        return load_persona(value)
+    return load_persona("config/persona.yaml")   # 默认人格兜底
+
+
+def build_orchestrator(persona: dict, user: str) -> tuple[Orchestrator, Harness, AuditLog]:
+    audit = AuditLog()
+    harness = Harness(RuleConfig(**persona.get("harness", {})), audit=audit)
+    orch = Orchestrator(persona=persona, harness=harness)
+    return orch, harness, audit
+
+
+def _print_draft(draft):
+    print("\n" + "=" * 50)
+    print(f"【{draft.title}】")
+    print(f"标签: {draft.tags}")
+    print("-" * 50)
+    print(draft.body)
+    print("-" * 50)
+    print(f"封面: {draft.cover_text}")
+
+
+def cmd_generate(args):
+    persona = resolve_persona_arg(args.persona)
+    orch, harness, audit = build_orchestrator(persona, args.user)
+    compliance = ComplianceEngine(load_compliance_config(args.compliance))
+
+    # 默认 Skill 链：路由 top-3 内容 Skill + 发布就绪门禁（触发 Harness 审批记录）
+    if args.skill_chain:
+        chain = args.skill_chain
+    else:
+        from core.registry import route as route_skills
+        chain = [n for n, _ in route_skills(args.topic, top_k=3)] + ["xhs_publish"]
+
+    if getattr(args, "engine", "python") == "langgraph":
+        from core.graph import LangGraphOrchestrator
+
+        draft = LangGraphOrchestrator(persona, harness).run(
+            topic=args.topic,
+            user_id=args.user,
+            skill_chain=chain,
+            thread_id=args.thread_id or f"cli-{args.user}-{uuid.uuid4().hex[:12]}",
+        )
+    else:
+        draft = orch.run(topic=args.topic, user_id=args.user, skill_chain=chain)
+    _print_draft(draft)
+
+    # 自动生成标题封面（多模态 · 零成本；--no-cover 关闭）
+    if getattr(args, "cover", True):
+        try:
+            from core.covergen import ensure_cover_for_draft
+            cover = ensure_cover_for_draft(draft)
+            if cover:
+                print(f"\n[封面] 已生成: {cover}")
+        except Exception as e:  # noqa: BLE001
+            print(f"\n[封面] 生成失败: {e}")
+
+    # 合规门禁（商用：发布前必检）
+    comp = compliance.check_draft(draft)
+    print(f"\n[合规] {comp.summary}")
+    for h in comp.hits:
+        print(f"  - {h}")
+    print(f"[就绪门禁] publish_ready={draft.metadata.get('publish_ready')} "
+          f"issues={draft.metadata.get('publish_issues', [])}")
+
+    if not comp.ok or draft.metadata.get("publish_ready") is not True:
+        print("\n发布已拦截：合规检查与发布就绪门禁必须同时通过。")
+        return
+
+    # 发布（默认干跑；--publish/--real 才真发）
+    if args.real and not real_publish_enabled():
+        print(f"\n[安全锁] {real_publish_disabled_message()}")
+        return
+    if args.real:
+        publisher = XhsPlaywrightPublisher(
+            storage_state=args.storage_state,
+            headless=not args.headed,
+            channel=args.browser,
+            harness=harness,
+            user_id=args.user,
+            keep_browser_on_failure=args.keep_open_on_failure,
+        )
+    else:
+        publisher = DryRunPublisher()
+    try:
+        result = publisher.publish(draft)
+        print(f"\n发布: {result.message} (耗时{result.cost_ms}ms)")
+    except Exception as e:  # noqa: BLE001 —— 审批拒绝/登录缺失等
+        print(f"\n发布未执行: {e}")
+
+    print(f"\n[审计] 共 {len(audit.entries)} 条记录")
+    for e in audit.entries[-6:]:
+        print(f"  - {e}")
+
+
+def cmd_publish(args):
+    """发布 content_bank 里的单篇稿件"""
+    from publishers.scheduler import ContentBank, PublishLog
+
+    data = json.load(open(args.draft, "r", encoding="utf-8-sig"))  # 容忍 BOM
+    persona = resolve_persona_arg(args.persona)
+    orch, harness, audit = build_orchestrator(persona, args.user)
+    compliance = ComplianceEngine(load_compliance_config(args.compliance))
+
+    from publishers.scheduler import BankItem
+    item = BankItem(path=args.draft, data=data)
+    draft = orch.run(topic=item.topic, user_id=args.user)
+    # 稿件自带字段优先
+    if data.get("title"):
+        draft.title = data["title"]
+    if data.get("body"):
+        draft.body = data["body"]
+    if data.get("tags"):
+        draft.tags = [str(t) for t in data["tags"]]
+    draft.metadata.update({"images": data.get("images", []), "cover": data.get("cover")})
+
+    _print_draft(draft)
+    comp = compliance.check_draft(draft)
+    print(f"\n[合规] {comp.summary}")
+    if not comp.ok:
+        for h in comp.hits:
+            print(f"  - {h}")
+        print("发布已拦截（先修改内容再重试）")
+        return
+
+    if args.real and not real_publish_enabled():
+        print(f"\n[安全锁] {real_publish_disabled_message()}")
+        return
+
+    publisher = DryRunPublisher() if not args.real else XhsPlaywrightPublisher(
+        storage_state=args.storage_state,
+        headless=not args.headed,
+        channel=args.browser,
+        auto_approve=args.yes,
+        harness=harness,
+        user_id=args.user,
+        keep_browser_on_failure=args.keep_open_on_failure,
+    )
+    try:
+        result = publisher.publish(draft)
+        print(f"\n发布: {result.message}")
+        if result.success:
+            log = PublishLog().load()
+            log.record(item.id, "published", url=result.url or "")
+        elif "未找到元素" in result.message:
+            print("\n💡 提示：小红书页面改版导致选择器失效。"
+                  "请运行 python main.py debug-selectors --browser msedge 导出真实页面结构，"
+                  "把输出和 logs/selector_debug.* 发给我，即可更新选择器。")
+    except Exception as e:  # noqa: BLE001
+        print(f"\n发布未执行: {e}")
+
+
+def cmd_schedule(args):
+    from publishers.scheduler import PublishScheduler, ContentBank, PublishLog
+
+    persona = resolve_persona_arg(args.persona)
+    orch, harness, audit = build_orchestrator(persona, args.user)
+    compliance = ComplianceEngine(load_compliance_config(args.compliance))
+
+    if args.real and not real_publish_enabled():
+        print(f"[安全锁] {real_publish_disabled_message()}")
+        return
+
+    publisher = DryRunPublisher() if not args.real else XhsPlaywrightPublisher(
+        storage_state=args.storage_state,
+        headless=not args.headed,
+        channel=args.browser,
+        auto_approve=args.yes,   # 无人值守必须显式 --yes
+        harness=harness,
+        user_id=args.user,
+    )
+    sched = PublishScheduler(
+        orchestrator=orch,
+        publisher=publisher,
+        compliance=compliance,
+        bank=ContentBank(args.bank),
+        log=PublishLog(),
+        auto_approve=args.yes,
+    )
+    if args.daemon:
+        print(f"[调度] 无人值守循环启动，每 {args.interval}s 扫描一次 content_bank（Ctrl+C 退出）")
+        try:
+            sched.run_loop(interval=args.interval)
+        except KeyboardInterrupt:
+            print("\n[调度] 已停止")
+    else:
+        report = sched.run_once()
+        if not report:
+            print("[调度] 当前无到期待发稿件")
+        for r in report:
+            print(f"  [{r['id']}] {r['topic']} → {r['status']}: {r.get('reason', r.get('url', ''))}")
+
+
+def cmd_login(args):
+    path = export_login_state(args.storage_state, headless=False, channel=args.browser)
+    print(f"登录态已保存: {path}")
+
+
+def cmd_debug_selectors(args):
+    shot = debug_selectors(
+        state_path=args.storage_state,
+        headless=not args.headed,
+        channel=args.browser,
+    )
+    print(f"\n诊断完成。把上面的输出 + {shot} + logs/selector_debug.html 发给维护者即可定位新选择器。")
+
+
+def cmd_notes(args):
+    """打开「笔记管理」核实真实发布结果"""
+    list_recent_notes(
+        state_path=args.storage_state,
+        headless=not args.headed,
+        channel=args.browser,
+        limit=args.limit,
+    )
+
+
+def cmd_personas(args):
+    """列出人格库，展示各人格摘要"""
+    from core.persona import list_personas, get_persona
+    names = list_personas()
+    if not names:
+        print("人格库为空（config/personas.yaml）")
+        return
+    print(f"人格库（{len(names)} 个）：")
+    for n in names:
+        p = get_persona(n)
+        print(f"  - {n}  [{p.get('tone', '-')}]  {p.get('description', '')[:44]}")
+    print("\n用法：生成/发布时用 --persona <名字> 选择，如:")
+    print('  python main.py generate --topic "考研英语" --persona 干货知识风')
+
+
+def cmd_probe(args):
+    """探测发布编辑器真实交互元素（找发布按钮）"""
+    probe_publish_ui(
+        state_path=args.storage_state,
+        headless=not args.headed,
+        channel=args.browser,
+        mode=args.mode,
+        upload_path=args.upload or "",
+    )
+
+
+def cmd_eval(args):
+    """复用 eval/scorer.py 逻辑，输出 eval_results.csv"""
+    from eval.scorer import main as eval_main
+    eval_main()
+
+
+def cmd_rag_eval(args):
+    """运行 RAG 质量门禁；返回码可直接用于 CI。"""
+    from eval.rag_scorer import (
+        compact_report, compare_modes, compare_rerankers, evaluate, write_report,
+    )
+
+    kwargs = dict(
+        eval_path=args.eval_set,
+        knowledge_dir=args.knowledge,
+        top_k=args.top_k,
+        embedding_backend=args.backend,
+        min_score=args.min_score,
+        min_recall=args.min_recall,
+        min_mrr=args.min_mrr,
+        min_no_hit=args.min_no_hit,
+        require_no_degradation=not args.allow_degraded,
+        parent_context=not args.flat_chunks,
+    )
+    if args.compare and args.compare_reranker:
+        raise SystemExit("--compare 与 --compare-reranker 不能同时使用")
+    if args.compare:
+        report = compare_modes(**kwargs)
+    elif args.compare_reranker:
+        report = compare_rerankers(
+            retrieval_mode=args.mode,
+            reranker_model=args.reranker_model,
+            **kwargs,
+        )
+    else:
+        report = evaluate(retrieval_mode=args.mode, **kwargs)
+    write_report(
+        report,
+        json_path=args.report_json,
+        markdown_path=args.report_md,
+    )
+    printable = compact_report(report) if args.summary_only else report
+    print(json.dumps(printable, ensure_ascii=False, indent=2))
+    raise SystemExit(0 if report["passed"] else 1)
+
+
+def cmd_telemetry(args):
+    """输出不含提示词、正文和工具参数的遥测聚合。"""
+    from core.observability import (
+        aggregate_usage,
+        load_usage_events,
+        safe_event_rows,
+        trace_events,
+    )
+
+    events, malformed = load_usage_events(args.path, limit=args.limit)
+    payload = aggregate_usage(events, malformed_lines=malformed).model_dump(mode="json")
+    if args.trace_id:
+        payload["trace_events"] = safe_event_rows(trace_events(events, args.trace_id))
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def cmd_feedback(args):
+    """查看反馈聚合；候选仅包含用户显式同意保留的脱敏内容。"""
+    from pathlib import Path
+
+    from core.feedback import AssistantFeedbackStore
+
+    store = AssistantFeedbackStore(args.path)
+    candidates = store.export_eval_candidates()
+    payload = {
+        "summary": store.summary().model_dump(mode="json"),
+        "candidates": candidates,
+    }
+    rendered = json.dumps(payload, ensure_ascii=False, indent=2)
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(rendered + "\n", encoding="utf-8")
+        print(f"已导出 {len(candidates)} 条待人工标注候选：{output_path}")
+    else:
+        print(rendered)
+
+
+def cmd_knowledge(args):
+    """本机操作者入口；不增加 HTTP 上传或发布权限。"""
+    from core.knowledge import KnowledgeBaseService
+    from pathlib import Path
+    from core.types import DocumentParseOptions, KnowledgeImportRequest, KnowledgeSearchRequest
+
+    try:
+        options = DocumentParseOptions(ocr_enabled=getattr(args, "ocr", False),
+            force_ocr=getattr(args, "force_ocr", False), model_root=getattr(args, "ocr_model_root", ""),
+            worker_python=getattr(args, "ocr_python", ""), timeout_seconds=getattr(args, "ocr_timeout", 120))
+        service = KnowledgeBaseService(args.db, args.source_root, chunk_size=args.chunk_size,
+            parse_options=options)
+        if args.action == "ingest":
+            result = service.ingest(KnowledgeImportRequest(kb_id=args.kb_id,
+                source_path=args.file, title=args.title, source_url=args.source_url, license=args.license,
+                accept_ocr_review=args.accept_ocr_review))
+            print(result.model_dump_json(indent=2))
+            if result.status == "failed":
+                raise SystemExit(1)
+        elif args.action == "inspect":
+            from core.document_parser import parse_document_result, read_local_document
+            _, data = read_local_document(Path(args.source_root), args.file)
+            parsed = parse_document_result(data, Path(args.file).suffix, options=options)
+            # Explicit local preview intentionally includes document text; never a log/API tool.
+            print(parsed.model_dump_json(indent=2))
+        elif args.action == "search":
+            result = service.search(KnowledgeSearchRequest(kb_id=args.kb_id, query=args.query,
+                top_k=args.top_k, min_score=args.min_score), backend=args.backend,
+                model=args.model or None, retrieval_mode=args.mode,
+                vector_store=args.vector_store, qdrant_path=args.qdrant_path)
+            print(result.model_dump_json(indent=2))
+        elif args.action == "answer":
+            from core.assistant import AssistantOrchestrator
+            from core.types import AssistantRequest
+
+            assistant = AssistantOrchestrator({"knowledge_catalog": {
+                "db_path": str(Path(args.db).resolve()),
+                "source_root": str(Path(args.source_root).resolve()),
+                "allowed_kb_ids": [args.kb_id], "embedding_backend": args.backend,
+                "embedding_model": args.model or "bge-m3", "retrieval_mode": args.mode,
+                "min_score": args.min_score, "top_k": args.top_k,
+                "vector_store": args.vector_store, "qdrant_path": args.qdrant_path}})
+            result = assistant.reply(AssistantRequest(question=args.query,
+                knowledge_source="catalog", kb_id=args.kb_id, task=args.task,
+                answer_mode=args.answer_mode, thread_id="knowledge-cli"))
+            print(result.model_dump_json(indent=2))
+        elif args.action == "list":
+            rows = service.store.documents(args.kb_id, include_deleted=args.include_deleted)
+            # Listing is metadata-only: do not dump every source chunk to the console.
+            print(json.dumps([row.model_dump(exclude={"chunks"}) | {"chunk_count": len(row.chunks)}
+                for row in rows], ensure_ascii=False, indent=2))
+        elif args.action == "graph":
+            from core.knowledge_graph import KnowledgeGraphService
+            from core.types import KnowledgeGraphQuery
+            result = KnowledgeGraphService(args.db).query(KnowledgeGraphQuery(
+                kb_id=args.kb_id, entity=args.entity, max_hops=args.hops, limit=args.limit))
+            print(result.model_dump_json(indent=2))
+        elif args.action == "jobs":
+            print(json.dumps([row.model_dump() for row in service.store.jobs(args.kb_id)], ensure_ascii=False, indent=2))
+        elif args.action == "delete":
+            if not args.yes:
+                raise ValueError("delete_requires_yes")
+            print(json.dumps({"deleted": service.delete(args.kb_id, args.document_id),
+                "source_file_removed": False}, ensure_ascii=False))
+        elif args.action == "recover":
+            if not args.yes:
+                raise ValueError("recover_requires_no_running_import_and_yes")
+            print(json.dumps({"abandoned_jobs": service.store.recover(args.kb_id)}, ensure_ascii=False))
+    except SystemExit:
+        raise
+    except Exception as exc:
+        from core.document_parser import DocumentError
+        # No arbitrary exception/secret/path contents in public command errors.
+        reason = str(exc) if isinstance(exc, DocumentError) else type(exc).__name__
+        print(json.dumps({"error": reason}, ensure_ascii=False))
+        raise SystemExit(1) from None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="personax",
+        description="PersonaX - 小红书内容生成与商用级自动发布",
+    )
+    parser.add_argument("--persona", default="config/persona.yaml",
+                        help="人格库名字（如 干货知识风）或 persona.yaml 路径；python main.py personas 查看可用人格")
+    parser.add_argument("--compliance", default="config/compliance.yaml")
+    parser.add_argument("--storage-state", default="storage_state.json")
+    sub = parser.add_subparsers(dest="command")
+
+    # generate（默认）
+    p_gen = sub.add_parser("generate", help="生成一篇笔记（默认命令）")
+    p_gen.add_argument("--topic", default="秋招穿搭")
+    p_gen.add_argument("--persona", default="config/persona.yaml",
+                       help="人格库名字（如 干货知识风）或 persona.yaml 路径")
+    p_gen.add_argument("--user", default="demo_user")
+    p_gen.add_argument("--skill-chain", nargs="*", default=None,
+                       help="指定 Skill 链，如: title_generator body_writer tag_selector cover_writer xhs_publish")
+    p_gen.add_argument("--engine", choices=["python", "langgraph"], default="python",
+                       help="编排引擎：python(默认稳定) / langgraph(状态图 + SQLite checkpoint)")
+    p_gen.add_argument("--thread-id", default=None,
+                       help="LangGraph 运行 ID；默认每次生成唯一 ID，便于追踪与隔离")
+    p_gen.add_argument("--real", action="store_true", help="真实发布（默认干跑）")
+    p_gen.add_argument("--publish", dest="real", action="store_true",
+                       help="[旧用法别名] 等价于 --real")
+    p_gen.add_argument("--headed", action="store_true", help="有头浏览器（调试用）")
+    p_gen.add_argument("--keep-open-on-failure", action="store_true",
+                       help="有头模式失败时保留浏览器，关闭窗口后结束")
+    p_gen.add_argument("--cover", action="store_true", default=True,
+                       help="自动生成标题封面（默认开启；--no-cover 关闭）")
+    p_gen.add_argument("--no-cover", dest="cover", action="store_false", help="不生成封面")
+    p_gen.add_argument("--browser", default=None, choices=["chromium", "chrome", "msedge"],
+                       help="浏览器：chromium(默认) / chrome(系统Chrome) / msedge(系统Edge，免下载)")
+    p_gen.set_defaults(func=cmd_generate)
+
+    # publish
+    p_pub = sub.add_parser("publish", help="发布 content_bank 里的单篇稿件")
+    p_pub.add_argument("--draft", required=True, help="稿件 JSON 路径，如 content_bank/example.json")
+    p_pub.add_argument("--persona", default="config/persona.yaml",
+                       help="人格库名字（如 干货知识风）或 persona.yaml 路径")
+    p_pub.add_argument("--user", default="demo_user")
+    p_pub.add_argument("--real", action="store_true", help="真实发布（默认干跑）")
+    p_pub.add_argument("--headed", action="store_true")
+    p_pub.add_argument("--keep-open-on-failure", action="store_true",
+                       help="有头模式失败时保留浏览器，关闭窗口后结束")
+    p_pub.add_argument("--yes", action="store_true", help="跳过人工确认（无人值守）")
+    p_pub.add_argument("--browser", default=None, choices=["chromium", "chrome", "msedge"],
+                       help="浏览器：chromium(默认) / chrome(系统Chrome) / msedge(系统Edge，免下载)")
+    p_pub.set_defaults(func=cmd_publish)
+
+    # schedule
+    p_sch = sub.add_parser("schedule", help="定时自动发布")
+    p_sch.add_argument("--bank", default="content_bank", help="内容库目录")
+    p_sch.add_argument("--persona", default="config/persona.yaml",
+                       help="人格库名字（如 干货知识风）或 persona.yaml 路径")
+    p_sch.add_argument("--user", default="demo_user")
+    p_sch.add_argument("--real", action="store_true", help="真实发布（默认干跑）")
+    p_sch.add_argument("--headed", action="store_true")
+    p_sch.add_argument("--yes", action="store_true", help="无人值守（跳过人工确认，需已登录）")
+    p_sch.add_argument("--daemon", action="store_true", help="循环模式")
+    p_sch.add_argument("--run-once", action="store_true", help="执行一次到期任务（默认行为）")
+    p_sch.add_argument("--interval", type=float, default=60.0, help="循环扫描间隔（秒）")
+    p_sch.add_argument("--browser", default=None, choices=["chromium", "chrome", "msedge"],
+                       help="浏览器：chromium(默认) / chrome(系统Chrome) / msedge(系统Edge，免下载)")
+    p_sch.set_defaults(func=cmd_schedule)
+
+    # login
+    p_login = sub.add_parser("login", help="浏览器登录一次并导出登录态")
+    p_login.add_argument("--browser", default=None, choices=["chromium", "chrome", "msedge"],
+                         help="浏览器：chromium(默认) / chrome(系统Chrome) / msedge(系统Edge，免下载)")
+    p_login.set_defaults(func=cmd_login)
+
+    # debug-selectors（改版排查）
+    p_dbg = sub.add_parser("debug-selectors", help="导出发布页真实元素结构（选择器失效时用）")
+    p_dbg.add_argument("--headed", action="store_true", help="有头浏览器")
+    p_dbg.add_argument("--browser", default=None, choices=["chromium", "chrome", "msedge"],
+                       help="浏览器：chromium(默认) / chrome(系统Chrome) / msedge(系统Edge，免下载)")
+    p_dbg.set_defaults(func=cmd_debug_selectors)
+
+    # notes（核实发布结果）
+    p_notes = sub.add_parser("notes", help="打开笔记管理，列出最近笔记核实发布")
+    p_notes.add_argument("--headed", action="store_true", help="有头浏览器")
+    p_notes.add_argument("--limit", type=int, default=10, help="最多列出条数")
+    p_notes.add_argument("--browser", default=None, choices=["chromium", "chrome", "msedge"],
+                         help="浏览器：chromium(默认) / chrome(系统Chrome) / msedge(系统Edge，免下载)")
+    p_notes.set_defaults(func=cmd_notes)
+
+    # personas（查看人格库）
+    p_pers = sub.add_parser("personas", help="列出人格库")
+    p_pers.set_defaults(func=cmd_personas)
+
+    # probe（找发布按钮）
+    p_probe = sub.add_parser("probe", help="探测发布编辑器真实按钮/输入框（定位发布按钮）")
+    p_probe.add_argument("--mode", default="tuwen", choices=["tuwen", "article"],
+                         help="tuwen=上传图文 / article=写长文")
+    p_probe.add_argument("--upload", default="", help="图片路径（tuwen 模式先传图再探测编辑器）")
+    p_probe.add_argument("--headed", action="store_true", help="有头浏览器")
+    p_probe.add_argument("--browser", default=None, choices=["chromium", "chrome", "msedge"],
+                         help="浏览器：chromium(默认) / chrome(系统Chrome) / msedge(系统Edge，免下载)")
+    p_probe.set_defaults(func=cmd_probe)
+
+    # eval
+    p_eval = sub.add_parser("eval", help="跑评测集输出 CSV")
+    p_eval.set_defaults(func=cmd_eval)
+
+    # rag-eval（可复现检索门禁）
+    p_rag_eval = sub.add_parser("rag-eval", help="跑 RAG 召回/拒检/延迟质量门禁")
+    p_rag_eval.add_argument("--eval-set", default="eval/rag_eval_set.json")
+    p_rag_eval.add_argument("--knowledge", default="knowledge")
+    p_rag_eval.add_argument("--top-k", type=int, default=5)
+    p_rag_eval.add_argument(
+        "--backend", choices=["hashing", "ollama", "sentence-transformers"],
+        default="hashing",
+    )
+    p_rag_eval.add_argument("--mode", choices=["bm25", "dense", "hybrid"], default="hybrid")
+    p_rag_eval.add_argument("--compare", action="store_true",
+                            help="依次运行 BM25、dense、hybrid 消融对比")
+    p_rag_eval.add_argument("--compare-reranker", action="store_true",
+                            help="比较 RRF 基线与 Cross-Encoder 重排")
+    p_rag_eval.add_argument("--reranker-model", default="BAAI/bge-reranker-base")
+    p_rag_eval.add_argument("--flat-chunks", action="store_true",
+                            help="关闭标题感知父子 Chunk，使用旧版固定切块对照")
+    p_rag_eval.add_argument(
+        "--min-score",
+        type=float,
+        default=None,
+        help="默认 hashing=0.15，Ollama/sentence-transformers=0.50",
+    )
+    p_rag_eval.add_argument("--min-recall", type=float, default=0.80)
+    p_rag_eval.add_argument("--min-mrr", type=float, default=0.75)
+    p_rag_eval.add_argument("--min-no-hit", type=float, default=0.75)
+    p_rag_eval.add_argument("--allow-degraded", action="store_true")
+    p_rag_eval.add_argument("--report-json", default="")
+    p_rag_eval.add_argument("--report-md", default="")
+    p_rag_eval.add_argument("--summary-only", action="store_true")
+    p_rag_eval.set_defaults(func=cmd_rag_eval)
+
+    # telemetry（安全聚合与端到端 Trace）
+    p_telemetry = sub.add_parser("telemetry", help="查看工具成功率、P95、Token 与 Trace")
+    p_telemetry.add_argument("--path", default="logs/usage.jsonl")
+    p_telemetry.add_argument("--limit", type=int, default=5_000)
+    p_telemetry.add_argument("--trace-id", default="")
+    p_telemetry.set_defaults(func=cmd_telemetry)
+
+    # feedback（真实失败样例闭环）
+    p_feedback = sub.add_parser("feedback", help="查看反馈聚合并导出评测候选")
+    p_feedback.add_argument("--path", default="logs/assistant_feedback.sqlite3")
+    p_feedback.add_argument("--output", default="", help="可选 JSON 输出路径")
+    p_feedback.set_defaults(func=cmd_feedback)
+
+    p_knowledge = sub.add_parser("knowledge", help="本地领域知识库生命周期（默认离线）")
+    p_knowledge.add_argument("--db", default="logs/knowledge.sqlite3")
+    p_knowledge.add_argument("--source-root", default="examples/ai_engineering")
+    p_knowledge.add_argument("--kb-id", default="ai-engineering")
+    p_knowledge.add_argument("--chunk-size", type=int, default=600)
+    ksub = p_knowledge.add_subparsers(dest="action", required=True)
+    k_ingest = ksub.add_parser("ingest", help="根目录内的相对路径；不会联网抓取")
+    k_ingest.add_argument("--file", required=True)
+    k_ingest.add_argument("--title", default="")
+    k_ingest.add_argument("--source-url", default="")
+    k_ingest.add_argument("--license", default="")
+    k_ingest.add_argument("--accept-ocr-review", action="store_true", help="已人工核对本次 OCR 正文；不代表自动准确率认证")
+    k_inspect = ksub.add_parser("inspect", help="本地预览解析正文与逐页质量；不提交版本")
+    k_inspect.add_argument("--file", required=True)
+    for command in (k_ingest, k_inspect):
+        command.add_argument("--ocr", action="store_true", help="显式启用本地 CPU OCR")
+        command.add_argument("--force-ocr", action="store_true", help="所有 PDF 页均 OCR；须同时 --ocr")
+        command.add_argument("--ocr-model-root", default=".rag_cache/ocr-models")
+        command.add_argument("--ocr-python", default="", help="可选独立 OCR 虚拟环境的 Python")
+        command.add_argument("--ocr-timeout", type=float, default=120)
+    k_search = ksub.add_parser("search", help="原文证据摘录，不自动调用生成模型")
+    k_search.add_argument("--query", required=True)
+    k_search.add_argument("--top-k", type=int, default=3)
+    k_search.add_argument("--min-score", type=float, default=0.15)
+    k_search.add_argument("--backend", choices=["hashing", "ollama", "sentence-transformers"], default="hashing")
+    k_search.add_argument("--model", default="")
+    k_search.add_argument("--mode", choices=["bm25", "hybrid", "dense"], default="hybrid")
+    k_search.add_argument("--vector-store", choices=["memory", "qdrant"], default="memory")
+    k_search.add_argument("--qdrant-path", default=".rag_cache/qdrant_catalog")
+    k_answer = ksub.add_parser("answer", help="目录库证据问答，默认不调用模型")
+    k_answer.add_argument("--query", required=True)
+    k_answer.add_argument("--top-k", type=int, default=4)
+    k_answer.add_argument("--min-score", type=float, default=0.15)
+    k_answer.add_argument("--backend", choices=["hashing", "ollama", "sentence-transformers"], default="hashing")
+    k_answer.add_argument("--model", default="")
+    k_answer.add_argument("--mode", choices=["bm25", "hybrid", "dense"], default="hybrid")
+    k_answer.add_argument("--task", choices=["qa", "compare", "summary"], default="qa")
+    k_answer.add_argument("--answer-mode", choices=["extractive", "llm"], default="extractive")
+    k_answer.add_argument("--vector-store", choices=["memory", "qdrant"], default="memory")
+    k_answer.add_argument("--qdrant-path", default=".rag_cache/qdrant_catalog")
+    k_list = ksub.add_parser("list")
+    k_graph = ksub.add_parser("graph", help="带来源的实体关联路径，不推断因果关系")
+    k_graph.add_argument("--entity", required=True)
+    k_graph.add_argument("--hops", type=int, choices=[1, 2], default=2)
+    k_graph.add_argument("--limit", type=int, default=10)
+    k_list.add_argument("--include-deleted", action="store_true")
+    ksub.add_parser("jobs")
+    k_delete = ksub.add_parser("delete", help="软删除目录记录，不删除原始文件")
+    k_delete.add_argument("--document-id", required=True)
+    k_delete.add_argument("--yes", action="store_true")
+    k_recover = ksub.add_parser("recover", help="确认无导入进程后，标记遗留任务 abandoned")
+    k_recover.add_argument("--yes", action="store_true")
+    p_knowledge.set_defaults(func=cmd_knowledge)
+
+    argv = sys.argv[1:]
+
+    # 兼容旧用法：`python main.py` / `python main.py --topic xxx [--publish]` → generate
+    if not argv or argv[0].startswith("-"):
+        if argv and argv[0] in ("--help", "-h"):
+            parser.parse_args(argv)   # 顶层帮助（显示全部子命令）并退出
+        ns = p_gen.parse_args(argv)
+        # 补上父级默认选项（--persona/--compliance/--storage-state）
+        parent_defaults = parser.parse_args([])
+        for opt in ("persona", "compliance", "storage_state"):
+            if not hasattr(ns, opt):
+                setattr(ns, opt, getattr(parent_defaults, opt))
+        cmd_generate(ns)
+        return
+
+    args = parser.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
